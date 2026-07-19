@@ -131,6 +131,26 @@ cbuffer CloudParams : register(b0) {
     float moon_earthshine;
     float sky_padding_0;
     float sky_padding_1;
+    int use_ae_camera;
+    float ae_camera_focal;
+    float ae_camera_padding_0;
+    float ae_camera_padding_1;
+    float ae_camera_origin_x;
+    float ae_camera_origin_y;
+    float ae_camera_origin_z;
+    float ae_camera_padding_2;
+    float ae_camera_right_x;
+    float ae_camera_right_y;
+    float ae_camera_right_z;
+    float ae_camera_padding_3;
+    float ae_camera_up_x;
+    float ae_camera_up_y;
+    float ae_camera_up_z;
+    float ae_camera_padding_4;
+    float ae_camera_forward_x;
+    float ae_camera_forward_y;
+    float ae_camera_forward_z;
+    float ae_camera_padding_5;
 };
 
 RWTexture2D<float4> InputTexture : register(u0);
@@ -820,6 +840,16 @@ float4 raymarch(float3 rayOrigin, float3 rayDirection,
                             * localBillowLight * detailLight
                             * lerp(0.58f, 1.14f, powder) * powderView;
             lighting += ambientTint * ambient;
+            // From above, the visible boundary is the strongly illuminated
+            // droplet field at cloud top. A small sky multiple-scattering term
+            // keeps that surface pearly instead of smoke-gray at backscatter
+            // angles, without flattening the self-shadowed cavities.
+            float aircraftTopView = smoothstep(
+                baseCloudLayerTop(), baseCloudLayerTop() + 1.0f,
+                rayOrigin.y) * smoothstep(0.04f, 0.72f, -rayDirection.y);
+            lighting += float3(0.24f, 0.29f, 0.36f) * daylight
+                      * aircraftTopView
+                      * lerp(0.42f, 1.0f, lightTransmittance);
             lighting *= lerp(1.0f, 0.64f, step(0.18f, low_coverage_offset));
 
             // Distance aerial perspective makes the volume belong to the sky
@@ -883,6 +913,11 @@ float4 raymarchMiddle(float3 rayOrigin, float3 rayDirection,
                             * lightVisibility * phase
                             * lerp(0.88f, 1.12f, cellular);
             lighting += middleAmbient * lerp(0.42f, 0.30f, cellular);
+            float aircraftTopView = smoothstep(
+                middleLayerTop(), middleLayerTop() + 1.0f,
+                rayOrigin.y) * smoothstep(0.04f, 0.72f, -rayDirection.y);
+            lighting += float3(0.22f, 0.27f, 0.34f) * daylight
+                      * aircraftTopView * lerp(0.45f, 1.0f, lightVisibility);
             float aerial = exp(-depth * 0.028f);
             lighting = lerp(middleAerial, lighting, aerial);
             radiance += transmittance * sampleAlpha * lighting;
@@ -945,9 +980,10 @@ R"(
 // layer split used by production real-time sky renderers.
 float sampleCirrus(float3 rayOrigin, float3 rayDirection) {
     float amount = cloudDeckProfile().z;
-    if (rayDirection.y <= 0.035f || amount <= 0.001f) return 0.0f;
     const float highAltitude = 10.5f;
-    float travel = highAltitude / rayDirection.y;
+    if (abs(rayDirection.y) <= 0.035f || amount <= 0.001f) return 0.0f;
+    float travel = (highAltitude - rayOrigin.y) / rayDirection.y;
+    if (travel <= 0.0f) return 0.0f;
     float2 worldXZ = rayOrigin.xz + rayDirection.xz * travel;
     float animationTime = cloudAnimationTime();
     float2 direction = windDirectionXZ();
@@ -1008,7 +1044,7 @@ float sampleCirrus(float3 rayOrigin, float3 rayDirection) {
                     + cirrostratus * veilWeight
                     + cirrocumulus * rippleWeight;
     return saturate(highCloud * amount)
-         * smoothstep(0.035f, 0.18f, rayDirection.y) * 0.45f;
+         * smoothstep(0.035f, 0.18f, abs(rayDirection.y)) * 0.45f;
 }
 
 )",
@@ -1124,14 +1160,16 @@ float sampleRainDensity(float3 p, float sourceHeight, float anchorPotential) {
 
 bool rayRainBounds(float3 ro, float3 rd, out float nearT, out float farT) {
     if (rain_enabled == 0 || rain_amount <= 0.001f
-        || rain_regime_factor <= 0.001f || rd.y <= 0.008f) {
+        || rain_regime_factor <= 0.001f || abs(rd.y) <= 0.008f) {
         nearT = 0.0f;
         farT = 0.0f;
         return false;
     }
     float sourceHeight = rainSourceHeight();
-    nearT = max((0.02f - ro.y) / rd.y, 0.0f);
-    farT = min((sourceHeight - ro.y) / rd.y, 62.0f);
+    float groundT = (0.02f - ro.y) / rd.y;
+    float sourceT = (sourceHeight - ro.y) / rd.y;
+    nearT = max(min(groundT, sourceT), 0.0f);
+    farT = min(max(groundT, sourceT), 62.0f);
     return farT > nearT + 0.01f;
 }
 
@@ -1148,7 +1186,7 @@ float4 raymarchRain(float3 rayOrigin, float3 rayDirection,
     float transmittance = 1.0f;
     float3 radiance = 0.0f;
     float sourceHeight = rainSourceHeight();
-    float sourceT = (sourceHeight - rayOrigin.y) / max(rayDirection.y, 0.008f);
+    float sourceT = (sourceHeight - rayOrigin.y) / rayDirection.y;
     float2 anchorXZ = (rayOrigin + rayDirection * sourceT).xz;
     float anchorPotential = sampleRainPotential(anchorXZ, sourceHeight);
     if (anchorPotential <= 0.001f) {
@@ -1559,10 +1597,14 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
     uv -= 0.5f;
     uv.x *= (float)width / (float)height;
 
-    // Camera Pitch is measured up from the horizon: 0 looks horizontally and
-    // the 90-degree default looks straight into the zenith. The analytic basis
-    // remains stable at 90 degrees, unlike a cross-product with world-up.
-    float3 ro = float3(0.0f, 0.0f, 0.0f);
+    // Manual mode remains a stable fallback when a composition has no active
+    // camera. Native mode receives AE's parent-resolved camera-to-world basis,
+    // focal distance, and position, including roll and vertical translation.
+    // That lets the same slab be viewed from the ground, within the cloud, or
+    // from above it instead of merely rotating a fixed ray origin.
+    float3 ro = use_ae_camera != 0
+        ? float3(ae_camera_origin_x, ae_camera_origin_y, ae_camera_origin_z)
+        : float3(0.0f, 0.0f, 0.0f);
     float focalLength = max(camera_dist * 0.20f, 0.25f);
     float pitchRadians = radians(clamp(camera_pitch, -89.9f, 90.0f));
     float yawRadians = radians(camera_yaw);
@@ -1576,6 +1618,15 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
         cosYaw * cosPitch);
     float3 cameraRight = float3(cosYaw, 0.0f, -sinYaw);
     float3 cameraUp = normalize(cross(cameraForward, cameraRight));
+    if (use_ae_camera != 0) {
+        focalLength = max(ae_camera_focal, 0.05f);
+        cameraRight = normalize(float3(
+            ae_camera_right_x, ae_camera_right_y, ae_camera_right_z));
+        cameraUp = normalize(float3(
+            ae_camera_up_x, ae_camera_up_y, ae_camera_up_z));
+        cameraForward = normalize(float3(
+            ae_camera_forward_x, ae_camera_forward_y, ae_camera_forward_z));
+    }
     float3 rd = normalize(
         cameraForward * focalLength
       + cameraRight * (uv.x * 1.04f)
@@ -1585,12 +1636,23 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
     float3 sky = renderAnalyticSky(rd, sunDirection);
     float cirrus = sampleCirrus(ro, rd);
     float daylight = smoothstep(-0.12f, 0.045f, sunDirection.y);
+    // A downward ray from aircraft altitude traverses dense lower atmosphere
+    // instead of the same below-horizon color used by a ground observer.
+    // Shift holes between cloud tops toward a daylight aerial blue (or muted
+    // night haze) as the native camera climbs above the low deck.
+    float aircraftAltitude = smoothstep(
+        baseCloudLayerTop(), baseCloudLayerTop() + 1.25f, ro.y);
+    float downwardView = smoothstep(0.03f, 0.72f, -rd.y);
+    float3 lowerAtmosphere = lerp(
+        float3(0.012f, 0.020f, 0.045f)
+            * (0.65f + max(night_brightness, 0.0f)),
+        float3(0.20f, 0.34f, 0.50f), daylight);
+    sky = lerp(sky, lowerAtmosphere,
+               aircraftAltitude * downwardView * 0.82f);
     float3 cirrusColor = lerp(
         float3(0.035f, 0.050f, 0.095f)
             * (0.45f + max(night_brightness, 0.0f)),
         float3(0.94f, 0.96f, 0.99f), daylight);
-    sky = lerp(sky, cirrusColor, cirrus);
-
     // Keep the tiny source-layer contribution out of the GPU upload path. The
     // CPU bridge adds input.rgb * 5% * final transmittance during its existing
     // readback loop, exactly where it already restores the AE layer alpha.
@@ -1601,23 +1663,38 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
     float jitter = 0.5f;
     float4 lowCloud = raymarch(ro, rd, sunDirection, jitter);
     float4 middleCloud = raymarchMiddle(ro, rd, sunDirection, jitter);
-    // From a ground observer the low deck is always in front of the middle
-    // deck. Compose their radiance/transmittance before placing them over the
-    // high ice layer and atmospheric background.
-    float4 cloud = float4(
-        lowCloud.rgb + lowCloud.a * middleCloud.rgb,
-        lowCloud.a * middleCloud.a);
-    float3 color = cloud.rgb + background * cloud.a;
+    float4 highCloud = float4(cirrusColor * cirrus, 1.0f - cirrus);
     float4 rain = raymarchRain(ro, rd, sunDirection, jitter);
-    // Precipitation occupies the sub-cloud atmosphere nearest the observer.
-    color = rain.rgb + color * rain.a;
+
+    // Atmospheric decks have a fixed vertical order. Reverse the compositor
+    // when looking down so an aircraft camera sees bright high/middle/low cloud
+    // tops in the correct depth order, with rain remaining beneath the deck.
+    float4 cloud;
+    if (rd.y >= 0.0f) {
+        float3 highAndMiddle = middleCloud.rgb + middleCloud.a * highCloud.rgb;
+        float highAndMiddleT = middleCloud.a * highCloud.a;
+        float3 allClouds = lowCloud.rgb + lowCloud.a * highAndMiddle;
+        float allCloudsT = lowCloud.a * highAndMiddleT;
+        cloud = float4(
+            rain.rgb + rain.a * allClouds,
+            rain.a * allCloudsT);
+    } else {
+        float3 lowAndRain = lowCloud.rgb + lowCloud.a * rain.rgb;
+        float lowAndRainT = lowCloud.a * rain.a;
+        float3 middleAndLow = middleCloud.rgb + middleCloud.a * lowAndRain;
+        float middleAndLowT = middleCloud.a * lowAndRainT;
+        cloud = float4(
+            highCloud.rgb + highCloud.a * middleAndLow,
+            highCloud.a * middleAndLowT);
+    }
+    float3 color = cloud.rgb + background * cloud.a;
 
     // The AE 8-bit transfer below expects display-referred values already.
     color = saturate(color);
 
     // Preserve cloud/rain transmittance for the edge-aware resolve and for the
     // exact source-layer composite performed during readback.
-    float4 result = float4(color, cloud.a * rain.a);
+    float4 result = float4(color, cloud.a);
 
     OutputTexture[pixel] = result;
 }
@@ -1748,9 +1825,29 @@ struct GPUCloudParams {
     float moon_earthshine;
     float sky_padding_0;
     float sky_padding_1;
+    int use_ae_camera;
+    float ae_camera_focal;
+    float ae_camera_padding_0;
+    float ae_camera_padding_1;
+    float ae_camera_origin_x;
+    float ae_camera_origin_y;
+    float ae_camera_origin_z;
+    float ae_camera_padding_2;
+    float ae_camera_right_x;
+    float ae_camera_right_y;
+    float ae_camera_right_z;
+    float ae_camera_padding_3;
+    float ae_camera_up_x;
+    float ae_camera_up_y;
+    float ae_camera_up_z;
+    float ae_camera_padding_4;
+    float ae_camera_forward_x;
+    float ae_camera_forward_y;
+    float ae_camera_forward_z;
+    float ae_camera_padding_5;
 };
 
-static_assert(sizeof(GPUCloudParams) == 304,
+static_assert(sizeof(GPUCloudParams) == 384,
               "GPU cloud constant buffer must match the HLSL layout");
 
 // Initialize DirectX 11 GPU resources
@@ -2128,9 +2225,9 @@ static bool RenderOnGPU(
 }
 
 #define NAME "VolumetricCloudShader"
-#define DESCRIPTION "Volumetric weather with explosive towers, day/night sky, stars, and phased moon"
+#define DESCRIPTION "Volumetric weather with native AE camera, continuous day cycle, and above-cloud views"
 #define MAJOR_VERSION 1
-#define MINOR_VERSION 12
+#define MINOR_VERSION 13
 #define BUG_VERSION 0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
@@ -2154,6 +2251,8 @@ enum {
     SUN_COLOR_PARAM,
     MANUAL_SUN_GROUP_END,
     CAMERA_GROUP_START,
+    USE_AE_CAMERA_PARAM,
+    AE_CAMERA_SCALE_PARAM,
     CAMERA_DIST_PARAM,
     CAMERA_PITCH_PARAM,
     CAMERA_YAW_PARAM,
@@ -2196,6 +2295,7 @@ enum {
     DAY_SKY_GROUP_START,
     DAY_CYCLE_ENABLED_PARAM,
     TIME_OF_DAY_PARAM,
+    DAY_CYCLE_PHASE_PARAM,
     DAY_CYCLE_SPEED_PARAM,
     SUN_PATH_ROTATION_PARAM,
     SUN_PEAK_ELEVATION_PARAM,
@@ -2300,6 +2400,9 @@ enum {
     MOON_GLOW_DISK_ID = 65,
     MOON_SURFACE_DETAIL_DISK_ID = 66,
     MOON_EARTHSHINE_DISK_ID = 67,
+    USE_AE_CAMERA_DISK_ID = 68,
+    AE_CAMERA_SCALE_DISK_ID = 69,
+    DAY_CYCLE_PHASE_DISK_ID = 70,
 
     CLOUD_VOLUME_GROUP_DISK_ID = 1001,
     CLOUD_VOLUME_GROUP_END_DISK_ID = 1002,
@@ -2652,7 +2755,8 @@ static PF_Err GlobalSetup(PF_InData *in_data, PF_OutData *out_data,
     out_data->out_flags = PF_OutFlag_PIX_INDEPENDENT;
     // Topics use START_COLLAPSED selectively, keeping the common controls
     // visible while advanced sections stay compact in AE's Effect Controls.
-    out_data->out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG;
+    out_data->out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG
+                         | PF_OutFlag2_I_USE_3D_CAMERA;
     // Shared D3D resources remain serialized by g_gpuMutex in Render().
     return PF_Err_NONE;
 }
@@ -2742,17 +2846,29 @@ static PF_Err ParamsSetup(PF_InData *in_data, PF_OutData *out_data,
     PF_ADD_TOPICX("Camera", PF_ParamFlag_START_COLLAPSED,
                   CAMERA_GROUP_DISK_ID);
 
+    // AE invalidates this effect when the active 3D camera changes because the
+    // global flags advertise PF_OutFlag2_I_USE_3D_CAMERA. If no camera exists,
+    // the three manual controls below remain the automatic fallback.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Focal Length", 1.0, 10.0, 1.0, 10.0, 3.0,
+    PF_ADD_CHECKBOX("Use Active AE Camera", "", TRUE, 0,
+                    USE_AE_CAMERA_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("AE Camera Translation Scale", 0.0, 1000.0,
+                         0.0, 1000.0, 100.0, PF_Precision_HUNDREDTHS,
+                         0, 0, AE_CAMERA_SCALE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Manual Focal Length", 1.0, 10.0, 1.0, 10.0, 3.0,
                          PF_Precision_HUNDREDTHS, 0, 0, CAMERA_DIST_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Pitch", -89.0, 90.0, -89.0, 90.0, 90.0,
+    PF_ADD_FLOAT_SLIDERX("Manual Pitch", -89.0, 90.0, -89.0, 90.0, 90.0,
                          PF_Precision_HUNDREDTHS, 0, 0, CAMERA_PITCH_DISK_ID);
 
     // Angle controls are cyclic and can be spun/keyframed beyond one turn.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_ANGLE("Yaw", 0.0, CAMERA_YAW_DISK_ID);
+    PF_ADD_ANGLE("Manual Yaw", 0.0, CAMERA_YAW_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_END_TOPIC(CAMERA_GROUP_END_DISK_ID);
@@ -2897,9 +3013,20 @@ static PF_Err ParamsSetup(PF_InData *in_data, PF_OutData *out_data,
     AEFX_CLR_STRUCT(def);
     PF_ADD_CHECKBOX("Enable Time of Day", "", TRUE, 0, DAY_CYCLE_ENABLED_DISK_ID);
 
+    // Preserve v1.12's bounded hour value for old projects without exposing a
+    // second competing control. The new phase angle is added relative to its
+    // noon default, so old projects retain their exact saved time of day.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Time of Day", 0.0, 24.0, 0.0, 24.0, 12.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TIME_OF_DAY_DISK_ID);
+    def.ui_flags = PF_PUI_INVISIBLE;
+    PF_ADD_FLOAT_SLIDER("Time of Day (Legacy)", -1000000.0, 1000000.0,
+                        0.0, 24.0, AEFX_DEFAULT_CURVE_TOLERANCE, 12.0,
+                        PF_Precision_HUNDREDTHS, 0, false,
+                        TIME_OF_DAY_DISK_ID);
+
+    // One revolution is one 24-hour day. AE angle controls accept unlimited
+    // positive and negative revolutions, so keyframes never hit an endpoint.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_ANGLE("Day Cycle Phase", 180.0, DAY_CYCLE_PHASE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Day Cycle Speed", -24.0, 24.0, -24.0, 24.0, 0.0,
@@ -3016,6 +3143,117 @@ static PF_Err ParamsSetup(PF_InData *in_data, PF_OutData *out_data,
     return PF_Err_NONE;
 }
 
+struct NativeAECameraState {
+    bool active;
+    float focal;
+    float origin_x, origin_y, origin_z;
+    float right_x, right_y, right_z;
+    float up_x, up_y, up_z;
+    float forward_x, forward_y, forward_z;
+};
+
+static bool NormalizeCameraVector(float *x, float *y, float *z) {
+    float length = sqrtf(*x * *x + *y * *y + *z * *z);
+    if (length <= 0.00001f) return false;
+    *x /= length;
+    *y /= length;
+    *z /= length;
+    return true;
+}
+
+// Resolve the active AE camera during PF_Cmd_RENDER. Adobe returns a
+// parent-resolved, row-based camera-to-world matrix. AE's +Y points down in
+// comp space, while this shader's +Y is altitude, so Y is flipped here once.
+// Four cloud-world units per composition height gives camera moves useful
+// physical range: an ordinary vertical crane move reaches the deck and a
+// larger aircraft move can climb cleanly above it.
+static bool ResolveNativeAECamera(PF_InData *in_data, int output_width,
+                                  int output_height, float translation_scale,
+                                  NativeAECameraState *camera) {
+    camera->active = false;
+    if (in_data->appl_id == kAppID_Premiere || translation_scale < 0.0f) {
+        return false;
+    }
+
+    AEGP_SuiteHandler suites(in_data->pica_basicP);
+    A_Time comp_time = {0, 1};
+    AEGP_LayerH camera_layer = NULL;
+    PF_Err err = suites.PFInterfaceSuite1()->AEGP_ConvertEffectToCompTime(
+        in_data->effect_ref, in_data->current_time, in_data->time_scale,
+        &comp_time);
+    if (err) return false;
+
+    err = suites.PFInterfaceSuite1()->AEGP_GetEffectCamera(
+        in_data->effect_ref, &comp_time, &camera_layer);
+    if (err || !camera_layer) return false;
+
+    A_Matrix4 matrix;
+    AEFX_CLR_STRUCT(matrix);
+    A_FpLong distance_to_plane = 0.0;
+    A_short plane_width = (A_short)(std::min)(output_width, 32767);
+    A_short plane_height = (A_short)(std::min)(output_height, 32767);
+    err = suites.PFInterfaceSuite1()->AEGP_GetEffectCameraMatrix(
+        in_data->effect_ref, &comp_time, &matrix, &distance_to_plane,
+        &plane_width, &plane_height);
+    if (err || plane_height <= 0 || fabs(distance_to_plane) <= 0.00001) {
+        return false;
+    }
+
+    // Rows 0 and 2 are camera-local right and forward in AE's row-vector
+    // convention. Rebuilding up with a cross product removes any scale while
+    // preserving camera roll and guarantees an orthonormal ray basis.
+    camera->right_x = (float)matrix.mat[0][0];
+    camera->right_y = (float)-matrix.mat[0][1];
+    camera->right_z = (float)matrix.mat[0][2];
+    camera->forward_x = (float)matrix.mat[2][0];
+    camera->forward_y = (float)-matrix.mat[2][1];
+    camera->forward_z = (float)matrix.mat[2][2];
+    if (!NormalizeCameraVector(&camera->right_x, &camera->right_y,
+                               &camera->right_z)
+        || !NormalizeCameraVector(&camera->forward_x, &camera->forward_y,
+                                  &camera->forward_z)) {
+        return false;
+    }
+    camera->up_x = camera->forward_y * camera->right_z
+                 - camera->forward_z * camera->right_y;
+    camera->up_y = camera->forward_z * camera->right_x
+                 - camera->forward_x * camera->right_z;
+    camera->up_z = camera->forward_x * camera->right_y
+                 - camera->forward_y * camera->right_x;
+    if (!NormalizeCameraVector(&camera->up_x, &camera->up_y,
+                               &camera->up_z)) {
+        return false;
+    }
+
+    A_FpLong default_distance = distance_to_plane;
+    AEGP_LayerH effect_layer = NULL;
+    AEGP_CompH comp = NULL;
+    if (!suites.PFInterfaceSuite1()->AEGP_GetEffectLayer(
+            in_data->effect_ref, &effect_layer)
+        && effect_layer
+        && !suites.LayerSuite5()->AEGP_GetLayerParentComp(effect_layer, &comp)
+        && comp) {
+        A_FpLong queried_default = 0.0;
+        if (!suites.CameraSuite2()->AEGP_GetDefaultCameraDistanceToImagePlane(
+                comp, &queried_default)
+            && fabs(queried_default) > 0.00001) {
+            default_distance = queried_default;
+        }
+    }
+
+    float scale = clampf(translation_scale / 100.0f, 0.0f, 10.0f);
+    float units_per_pixel = 4.0f * scale / (float)plane_height;
+    camera->origin_x = ((float)matrix.mat[3][0] - (float)plane_width * 0.5f)
+                     * units_per_pixel;
+    camera->origin_y = -((float)matrix.mat[3][1] - (float)plane_height * 0.5f)
+                     * units_per_pixel;
+    camera->origin_z = ((float)matrix.mat[3][2] + (float)default_distance)
+                     * units_per_pixel;
+    camera->focal = (float)(fabs(distance_to_plane) / (double)plane_height);
+    camera->active = true;
+    return true;
+}
+
 static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
                      PF_ParamDef *params[], PF_LayerDef *output) {
     PF_LayerDef *input = &params[INPUT_LAYER]->u.ld;
@@ -3039,6 +3277,9 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     float wind_speed = (float)params[WIND_SPEED_PARAM]->u.fs_d.value / 100.0f;
     float noise_scale = (float)params[NOISE_SCALE_PARAM]->u.fs_d.value;
     int detail = (int)params[DETAIL_PARAM]->u.fs_d.value;
+    int use_ae_camera = params[USE_AE_CAMERA_PARAM]->u.bd.value ? 1 : 0;
+    float ae_camera_scale =
+        (float)params[AE_CAMERA_SCALE_PARAM]->u.fs_d.value;
     float camera_dist = (float)params[CAMERA_DIST_PARAM]->u.fs_d.value;
     float camera_pitch = (float)params[CAMERA_PITCH_PARAM]->u.fs_d.value;
     float camera_yaw = (float)FIX_2_FLOAT(
@@ -3087,6 +3328,8 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
         params[DAY_CYCLE_ENABLED_PARAM]->u.bd.value ? 1 : 0;
     float time_of_day =
         (float)params[TIME_OF_DAY_PARAM]->u.fs_d.value;
+    float day_cycle_phase = (float)FIX_2_FLOAT(
+        params[DAY_CYCLE_PHASE_PARAM]->u.ad.value);
     float day_cycle_speed =
         (float)params[DAY_CYCLE_SPEED_PARAM]->u.fs_d.value;
     float sun_path_rotation = (float)FIX_2_FLOAT(
@@ -3223,15 +3466,29 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     if (cloud_regime == 1) {
         resolved_rain_factor += resolved_storm * 0.35f;
     }
+
+    NativeAECameraState ae_camera = {};
+    ae_camera.focal = camera_dist * 0.20f;
+    ae_camera.right_x = 1.0f;
+    ae_camera.up_y = 1.0f;
+    ae_camera.forward_z = 1.0f;
+    if (use_ae_camera != 0) {
+        ResolveNativeAECamera(in_data, output->width, output->height,
+                              ae_camera_scale, &ae_camera);
+    }
+
     // Time remains physical seconds. HLSL applies wind speed exactly once.
     float time = (float)in_data->current_time / (float)in_data->time_scale;
 
     // A great-circle solar path gives stable sunrise/noon/sunset positions.
     // Peak elevation acts like a simple latitude control; path rotation turns
-    // east/west around the horizon. A zero cycle speed leaves Time of Day fully
-    // keyframeable, while non-zero values animate hours per comp second.
+    // east/west around the horizon. Day Cycle Phase is an unlimited AE angle:
+    // 360 degrees is one 24-hour loop, with 0 at midnight and 180 at noon.
+    // The hidden v1.12 hour value remains as a compatibility base offset.
     if (day_cycle_enabled != 0) {
-        float resolved_hours = fmodf(time_of_day + time * day_cycle_speed, 24.0f);
+        float phase_hours = (day_cycle_phase - 180.0f) / 15.0f;
+        float resolved_hours = fmodf(
+            time_of_day + phase_hours + time * day_cycle_speed, 24.0f);
         if (resolved_hours < 0.0f) resolved_hours += 24.0f;
         float hour_angle = (resolved_hours - 12.0f) * (PI / 12.0f);
         float latitude = (90.0f - clampf(sun_peak_elevation, 5.0f, 90.0f))
@@ -3332,6 +3589,26 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     gpu_params.moon_earthshine = moon_earthshine;
     gpu_params.sky_padding_0 = 0.0f;
     gpu_params.sky_padding_1 = 0.0f;
+    gpu_params.use_ae_camera = ae_camera.active ? 1 : 0;
+    gpu_params.ae_camera_focal = ae_camera.focal;
+    gpu_params.ae_camera_padding_0 = 0.0f;
+    gpu_params.ae_camera_padding_1 = 0.0f;
+    gpu_params.ae_camera_origin_x = ae_camera.origin_x;
+    gpu_params.ae_camera_origin_y = ae_camera.origin_y;
+    gpu_params.ae_camera_origin_z = ae_camera.origin_z;
+    gpu_params.ae_camera_padding_2 = 0.0f;
+    gpu_params.ae_camera_right_x = ae_camera.right_x;
+    gpu_params.ae_camera_right_y = ae_camera.right_y;
+    gpu_params.ae_camera_right_z = ae_camera.right_z;
+    gpu_params.ae_camera_padding_3 = 0.0f;
+    gpu_params.ae_camera_up_x = ae_camera.up_x;
+    gpu_params.ae_camera_up_y = ae_camera.up_y;
+    gpu_params.ae_camera_up_z = ae_camera.up_z;
+    gpu_params.ae_camera_padding_4 = 0.0f;
+    gpu_params.ae_camera_forward_x = ae_camera.forward_x;
+    gpu_params.ae_camera_forward_y = ae_camera.forward_y;
+    gpu_params.ae_camera_forward_z = ae_camera.forward_z;
+    gpu_params.ae_camera_padding_5 = 0.0f;
 
     // Try GPU rendering, fall back to CPU if it fails
     bool gpuSuccess = RenderOnGPU(

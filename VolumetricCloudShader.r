@@ -32,7 +32,7 @@ resource 'PiPL' (16000) {
             PF_PLUG_IN_SUBVERS
         },
         AE_Effect_Version {
-            524289    /* 1.0 */
+            950273    /* 1.13 */
         },
         AE_Effect_Info_Flags {
             0
@@ -41,7 +41,7 @@ resource 'PiPL' (16000) {
             0x2000414
         },
         AE_Effect_Global_OutFlags_2 {
-            0x8000000
+            0x8000002
         },
         AE_Effect_Match_Name {
             "VolumetricCloudShader"
