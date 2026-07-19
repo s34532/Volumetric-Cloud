@@ -27,8 +27,6 @@
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <mutex>
-#include <new>
-#include <vector>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -55,9 +53,6 @@ static int g_cachedWidth = 0;
 static int g_cachedHeight = 0;
 static bool g_gpuInitialized = false;
 static bool g_gpuFailed = false;
-// AE's classic render callback supplies PF_Pixel8. Keeping a float4 copy of an
-// 8-bit frame retained 16 bytes per pixel for no output-quality benefit.
-static std::vector<unsigned char> g_uploadBuffer;
 
 // HLSL atmospheric cloud renderer. Its shape/lighting split follows the
 // production techniques published by Rockstar and Guerrilla at SIGGRAPH.
@@ -721,7 +716,54 @@ float4 raymarch(float3 rayOrigin, float3 rayDirection,
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
     }
 
-    float stepLength = (farT - nearT) / max((float)march_steps, 1.0f);
+    // The conservative vertical ceiling of a deep tower can project far past
+    // its localized horizontal footprint at low camera pitch. Distributing a
+    // fixed sample count over that empty tail creates visible depth terraces.
+    // Intersect the view ray with the hero updraft footprint and retain the
+    // ordinary deck bound outside it, concentrating work where density exists.
+    float heroRayHit = 0.0f;
+    if (tower_development > 0.001f && tower_isolation > 0.25f) {
+        float widthControl = saturate((tower_scale - 0.25f) / 2.75f);
+        float towerRadius = lerp(4.0f, 22.0f, widthControl);
+        float3 towerWind = animatedCloudOffset(
+            float3(tower_position_x, cloudLayerBase(), tower_distance),
+            0.28f, 0.82f);
+        float2 towerCenter = float2(tower_position_x, tower_distance)
+                           + towerWind.xz;
+        float2 footprintRadii = float2(towerRadius, towerRadius * 0.78f) * 1.18f;
+        float2 scaledOrigin = (rayOrigin.xz - towerCenter) / footprintRadii;
+        float2 scaledDirection = rayDirection.xz / footprintRadii;
+        float quadraticA = dot(scaledDirection, scaledDirection);
+        float quadraticB = dot(scaledOrigin, scaledDirection);
+        float quadraticC = dot(scaledOrigin, scaledOrigin) - 1.0f;
+        float discriminant = quadraticB * quadraticB - quadraticA * quadraticC;
+
+        float ordinaryTop = baseCloudLayerTop() + cloudDeckProfile().w * 4.2f;
+        float ordinaryTopT = (ordinaryTop - rayOrigin.y) / rayDirection.y;
+        float focusedFar = min(farT, max(nearT, ordinaryTopT));
+        if (quadraticA > EPSILON && discriminant >= 0.0f) {
+            float towerExit = (-quadraticB + sqrt(discriminant)) / quadraticA;
+            if (towerExit > nearT) {
+                focusedFar = max(focusedFar, min(farT, towerExit + 1.25f));
+                heroRayHit = 1.0f;
+            }
+        } else if (quadraticC <= 0.0f) {
+            // Near-vertical ray already inside the tower footprint.
+            focusedFar = farT;
+            heroRayHit = 1.0f;
+        }
+        float focusStrength = smoothstep(0.25f, 0.65f, tower_isolation)
+                            * saturate(tower_development);
+        farT = lerp(farT, min(farT, focusedFar), focusStrength);
+    }
+
+    float pathLength = farT - nearT;
+    float towerStepTarget = lerp(
+        0.46f, 0.30f, saturate(tower_development * 0.75f));
+    int spatialSteps = (int)ceil(pathLength / max(towerStepTarget, 0.20f));
+    int effectiveSteps = min(120, max(march_steps,
+        (int)lerp((float)march_steps, (float)spatialSteps, heroRayHit)));
+    float stepLength = pathLength / max((float)effectiveSteps, 1.0f);
     float depth = nearT + stepLength * jitter;
     float transmittance = 1.0f;
     float3 radiance = 0.0f;
@@ -747,7 +789,7 @@ float4 raymarch(float3 rayOrigin, float3 rayDirection,
         float3(0.63f, 0.72f, 0.82f), daylight);
 
     [loop]
-    for (int i = 0; i < march_steps; ++i) {
+    for (int i = 0; i < effectiveSteps; ++i) {
         if (depth > farT || transmittance < 0.008f) break;
         float3 p = rayOrigin + rayDirection * depth;
         // The detailed sampler already exits after its weather/base checks in
@@ -1441,8 +1483,10 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
         float3(0.94f, 0.96f, 0.99f), daylight);
     sky = lerp(sky, cirrusColor, cirrus);
 
-    float4 orig = InputTexture[pixel];
-    float3 background = lerp(sky, orig.rgb, 0.05f);
+    // Keep the tiny source-layer contribution out of the GPU upload path. The
+    // CPU bridge adds input.rgb * 5% * final transmittance during its existing
+    // readback loop, exactly where it already restores the AE layer alpha.
+    float3 background = sky * 0.95f;
     // AE has no temporal accumulation pass to hide a blue-noise depth phase.
     // A deterministic midpoint integral at full pixel resolution preserves
     // fine erosion without baking a stipple/checker pattern into every frame.
@@ -1463,8 +1507,8 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
     // The AE 8-bit transfer below expects display-referred values already.
     color = saturate(color);
 
-    // Preserve cloud/rain transmittance for the edge-aware resolve. The
-    // original AE layer alpha remains available in InputTexture.
+    // Preserve cloud/rain transmittance for the edge-aware resolve and for the
+    // exact source-layer composite performed during readback.
     float4 result = float4(color, cloud.a * rain.a);
 
     OutputTexture[pixel] = result;
@@ -1508,8 +1552,7 @@ void CSSharpen(uint3 DTid : SV_DispatchThreadID) {
     float volumetricOpacity = saturate((1.0f - center.a) * 8.0f);
     float3 resolved = center.rgb
                     + (center.rgb - filtered) * (0.42f * volumetricOpacity);
-    float originalAlpha = InputTexture[p].a;
-    InputTexture[p] = float4(saturate(resolved), originalAlpha);
+    InputTexture[p] = float4(saturate(resolved), center.a);
 }
 )";
 
@@ -1764,7 +1807,10 @@ static bool InitializeGPU() {
     noiseDesc.Height = 128;
     noiseDesc.Depth = 128;
     noiseDesc.MipLevels = 1;
-    noiseDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // Every baked channel is normalized to 0..1 and sampled with linear
+    // filtering. RGBA8 preserves 256 density/erosion levels while halving the
+    // persistent 128^3 volume from 16 MiB to 8 MiB.
+    noiseDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     noiseDesc.Usage = D3D11_USAGE_DEFAULT;
     noiseDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     hr = g_device->CreateTexture3D(&noiseDesc, nullptr, &g_noiseTex);
@@ -1802,6 +1848,13 @@ static bool InitializeGPU() {
     g_context->CSSetUnorderedAccessViews(2, 1, &nullNoiseUAV, nullptr);
     g_context->CSSetShader(nullptr, nullptr, 0);
 
+    // The bake shader and its UAV are one-shot construction resources. The
+    // rendered volume remains alive through its SRV for all subsequent frames.
+    g_noiseUAV->Release();
+    g_noiseUAV = nullptr;
+    g_noiseShader->Release();
+    g_noiseShader = nullptr;
+
     g_gpuInitialized = true;
     return true;
 }
@@ -1814,9 +1867,6 @@ static void ReleaseGPUResources() {
     if (g_outputTex) { g_outputTex->Release(); g_outputTex = nullptr; }
     if (g_stagingTex) { g_stagingTex->Release(); g_stagingTex = nullptr; }
     if (g_constantBuffer) { g_constantBuffer->Release(); g_constantBuffer = nullptr; }
-    // clear() retains vector capacity, which kept the largest comp allocation
-    // alive after switching to a smaller comp. swap releases it deterministically.
-    std::vector<unsigned char>().swap(g_uploadBuffer);
     g_cachedWidth = 0;
     g_cachedHeight = 0;
 }
@@ -1885,13 +1935,6 @@ static bool RenderOnGPU(
         hr = g_device->CreateTexture2D(&stagingDesc, nullptr, &g_stagingTex);
         if (FAILED(hr)) { ReleaseGPUResources(); return false; }
 
-        try {
-            g_uploadBuffer.resize(static_cast<size_t>(width) * height * 4);
-        } catch (const std::bad_alloc&) {
-            ReleaseGPUResources();
-            return false;
-        }
-
         g_cachedWidth = width;
         g_cachedHeight = height;
     }
@@ -1902,22 +1945,6 @@ static bool RenderOnGPU(
     if (FAILED(hr)) return false;
     memcpy(mapped.pData, params, sizeof(GPUCloudParams));
     g_context->Unmap(g_constantBuffer, 0);
-
-    // Upload input data to texture
-    unsigned char* inputBytes = g_uploadBuffer.data();
-    for (int y = 0; y < height; y++) {
-        PF_Pixel8* row = (PF_Pixel8*)((char*)in_data + y * in_rowbytes);
-        unsigned char* destination = inputBytes + static_cast<size_t>(y) * width * 4;
-        for (int x = 0; x < width; x++) {
-            destination[0] = row[x].red;
-            destination[1] = row[x].green;
-            destination[2] = row[x].blue;
-            destination[3] = row[x].alpha;
-            destination += 4;
-        }
-    }
-
-    g_context->UpdateSubresource(g_inputTex, 0, nullptr, inputBytes, width * 4, 0);
 
     // Set up and dispatch compute shader
     g_context->CSSetShader(g_computeShader, nullptr, 0);
@@ -1943,6 +1970,10 @@ static bool RenderOnGPU(
     g_context->Dispatch(groupsX, groupsY, 1);
     g_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
     g_context->CSSetShader(nullptr, nullptr, 0);
+    ID3D11Buffer* nullConstantBuffer = nullptr;
+    ID3D11SamplerState* nullSampler = nullptr;
+    g_context->CSSetConstantBuffers(0, 1, &nullConstantBuffer);
+    g_context->CSSetSamplers(0, 1, &nullSampler);
 
     // Read back results
     g_context->CopyResource(g_stagingTex, g_inputTex);
@@ -1954,13 +1985,22 @@ static bool RenderOnGPU(
 
         for (int y = 0; y < height; y++) {
             PF_Pixel8* outRow = (PF_Pixel8*)((char*)out_data + y * out_rowbytes);
+            const PF_Pixel8* inRow =
+                (const PF_Pixel8*)((const char*)in_data + y * in_rowbytes);
             const unsigned char* sourceRow = outputBytes + y * mapped.RowPitch;
             for (int x = 0; x < width; x++) {
                 int srcIdx = x * 4;
-                outRow[x].red = sourceRow[srcIdx + 0];
-                outRow[x].green = sourceRow[srcIdx + 1];
-                outRow[x].blue = sourceRow[srcIdx + 2];
-                outRow[x].alpha = sourceRow[srcIdx + 3];
+                float sourceWeight = sourceRow[srcIdx + 3] * (0.05f / 255.0f);
+                int red = sourceRow[srcIdx + 0]
+                        + (int)(inRow[x].red * sourceWeight + 0.5f);
+                int green = sourceRow[srcIdx + 1]
+                          + (int)(inRow[x].green * sourceWeight + 0.5f);
+                int blue = sourceRow[srcIdx + 2]
+                         + (int)(inRow[x].blue * sourceWeight + 0.5f);
+                outRow[x].red = (A_u_char)((std::min)(red, 255));
+                outRow[x].green = (A_u_char)((std::min)(green, 255));
+                outRow[x].blue = (A_u_char)((std::min)(blue, 255));
+                outRow[x].alpha = inRow[x].alpha;
             }
         }
         g_context->Unmap(g_stagingTex, 0);
@@ -1972,7 +2012,7 @@ static bool RenderOnGPU(
 #define NAME "VolumetricCloudShader"
 #define DESCRIPTION "Volumetric weather with explosive towers, day/night sky, stars, and phased moon"
 #define MAJOR_VERSION 1
-#define MINOR_VERSION 10
+#define MINOR_VERSION 11
 #define BUG_VERSION 0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
