@@ -27,6 +27,7 @@
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <mutex>
+#include <string>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -56,7 +57,7 @@ static bool g_gpuFailed = false;
 
 // HLSL atmospheric cloud renderer. Its shape/lighting split follows the
 // production techniques published by Rockstar and Guerrilla at SIGGRAPH.
-static const char* g_shaderCode = R"(
+static const char* g_shaderCodeChunks[] = { R"(
 cbuffer CloudParams : register(b0) {
     float cloud_radius;
     float cloud_density;
@@ -394,7 +395,7 @@ float sampleLightingDetail(float3 p) {
     return saturate(detailNoise.g * 0.44f + detailNoise.b * 0.56f);
 }
 
-)"
+)",
 R"(
 // Production-style two-level Nubis density model: weather and height define a
 // coherent low-frequency body, then a separate cellular field erodes only its
@@ -572,7 +573,7 @@ float sampleDensity(float3 p, bool coarse) {
     return density * max(cloud_density * 1.28f, 0.0f) * decks.x;
 }
 
-)"
+)",
 R"(
 // Temperate middle-level deck (roughly the WMO 2-7 km band in normalized
 // scene units). Altocumulus uses cellular streets; altostratus/nimbostratus
@@ -707,7 +708,7 @@ float lightmarch(float3 position, float3 sunDirection) {
     return direct * 0.61f + scatter2 * 0.29f + scatter3 * 0.10f;
 }
 
-)"
+)",
 R"(
 float4 raymarch(float3 rayOrigin, float3 rayDirection,
                 float3 sunDirection, float jitter) {
@@ -937,7 +938,7 @@ void CSNoise(uint3 DTid : SV_DispatchThreadID) {
         saturate(warp));
 }
 
-)"
+)",
 R"(
 // Thin upper-atmosphere clouds do not need a full volume march.  Projecting a
 // stretched, ridged noise field onto a high plane follows the same low/high
@@ -1010,7 +1011,7 @@ float sampleCirrus(float3 rayOrigin, float3 rayDirection) {
          * smoothstep(0.035f, 0.18f, rayDirection.y) * 0.45f;
 }
 
-)"
+)",
 R"(
 // Rain is a sparse world-space participating medium beneath the cloud base,
 // rather than a screen-space overlay. Its attachment mask follows the same
@@ -1188,7 +1189,7 @@ float4 raymarchRain(float3 rayOrigin, float3 rayDirection,
     return float4(radiance, transmittance);
 }
 
-)"
+)",
 R"(
 // Compact analytic atmosphere: solar elevation controls the day/night blend,
 // while view elevation and angle from the sun approximate Rayleigh/Mie color
@@ -1260,23 +1261,90 @@ float3 renderStars(float3 rayDirection, float3 sunDirection) {
          * max(star_brightness, 0.0f) * visibility;
 }
 
-float lunarCraterLayer(float2 discPosition, float scale, float seedOffset) {
-    float2 gridPosition = (discPosition * 0.5f + 0.5f) * scale;
-    float2 cell = floor(gridPosition);
-    float2 local = frac(gridPosition) - 0.5f;
-    float2 center = float2(
-        hash12(cell + seedOffset),
-        hash12(cell + seedOffset + 19.7f)) - 0.5f;
-    center *= 0.58f;
-    float radius = lerp(0.12f, 0.34f,
-        hash12(cell + seedOffset + 43.1f));
-    float normalizedDistance = length(local - center) / max(radius, 0.02f);
-    float bowl = 1.0f - smoothstep(0.18f, 1.0f, normalizedDistance);
-    float rim = 1.0f - smoothstep(
-        0.0f, 0.18f, abs(normalizedDistance - 1.0f));
-    return rim * 0.62f - bowl * 0.48f;
+float lunarEllipse(float2 p, float2 center, float2 radii,
+                   float softness) {
+    float distanceToBasin = length((p - center) / max(radii, 0.001f));
+    return 1.0f - smoothstep(1.0f - softness,
+                             1.0f + softness, distanceToBasin);
 }
 
+float lunarMaria(float2 p) {
+    // Broad overlapping basalt basins approximate the recognizable near-side
+    // geography instead of using uniform noise across the whole disc.
+    float2 warpedPosition = p + float2(
+        fbm2d4(p * 3.1f + 17.3f) - 0.5f,
+        fbm2d4(p.yx * 3.4f + 41.8f) - 0.5f) * 0.075f;
+    float maria = 0.0f;
+    maria += lunarEllipse(warpedPosition, float2(-0.46f, 0.05f),
+                          float2(0.32f, 0.53f), 0.22f) * 0.64f;
+    maria += lunarEllipse(warpedPosition, float2(-0.22f, 0.39f),
+                          float2(0.31f, 0.24f), 0.16f) * 0.78f;
+    maria += lunarEllipse(warpedPosition, float2(0.16f, 0.37f),
+                          float2(0.23f, 0.18f), 0.14f) * 0.72f;
+    maria += lunarEllipse(warpedPosition, float2(0.31f, 0.10f),
+                          float2(0.25f, 0.20f), 0.16f) * 0.74f;
+    maria += lunarEllipse(warpedPosition, float2(0.44f, -0.20f),
+                          float2(0.20f, 0.25f), 0.16f) * 0.62f;
+    maria += lunarEllipse(warpedPosition, float2(-0.13f, -0.27f),
+                          float2(0.27f, 0.18f), 0.18f) * 0.55f;
+    maria += lunarEllipse(warpedPosition, float2(0.59f, 0.31f),
+                          float2(0.13f, 0.16f), 0.12f) * 0.70f;
+    float basinVariation = lerp(0.78f, 1.12f,
+        fbm2d4(warpedPosition * 5.2f + 8.6f));
+    return smoothstep(0.05f, 0.92f, saturate(maria * basinVariation));
+}
+
+float lunarCraterHeight(float2 p, float2 center, float radius,
+                        float depth) {
+    float normalizedDistance = length(p - center) / max(radius, 0.001f);
+    float bowl = -depth * (1.0f - normalizedDistance * normalizedDistance)
+               * (1.0f - smoothstep(0.68f, 1.0f, normalizedDistance));
+    float rimDistance = (normalizedDistance - 1.0f) / 0.105f;
+    float rim = depth * 0.48f * exp(-rimDistance * rimDistance);
+    return (normalizedDistance < 1.42f) ? bowl + rim : 0.0f;
+}
+
+float lunarCellCraterHeight(float2 p, float scale, float seedOffset) {
+    float2 gridPosition = (p * 0.5f + 0.5f) * scale;
+    float2 cell = floor(gridPosition);
+    float2 local = frac(gridPosition) - 0.5f;
+    float2 center = float2(hash12(cell + seedOffset),
+                           hash12(cell + seedOffset + 19.7f)) - 0.5f;
+    center *= 0.66f;
+    float probability = hash12(cell + seedOffset + 73.1f);
+    float radius = lerp(0.075f, 0.24f,
+                        hash12(cell + seedOffset + 43.1f));
+    float crater = lunarCraterHeight(local, center, radius, 0.011f);
+    return crater * step(0.68f, probability);
+}
+
+float lunarTerrainHeight(float2 p) {
+    // A few persistent named-scale structures anchor the surface, while two
+    // sparse cellular layers fill in small craters without an obvious grid.
+    float heightField = 0.0f;
+    heightField += lunarCraterHeight(p, float2(-0.28f, 0.03f), 0.105f, 0.018f);
+    heightField += lunarCraterHeight(p, float2(0.18f, -0.55f), 0.125f, 0.022f);
+    heightField += lunarCraterHeight(p, float2(0.50f, -0.05f), 0.080f, 0.014f);
+    heightField += lunarCraterHeight(p, float2(-0.53f, 0.33f), 0.074f, 0.012f);
+    heightField += lunarCellCraterHeight(p, 9.0f, 11.2f);
+    heightField += lunarCellCraterHeight(p, 19.0f, 47.6f) * 0.42f;
+    return heightField;
+}
+
+float lunarEjecta(float2 p, float2 center, float radius, float seed) {
+    float2 offset = p - center;
+    float distanceFromCrater = length(offset);
+    float angle = atan2(offset.y, offset.x);
+    float spokes = pow(saturate(0.50f + 0.27f * sin(angle * 11.0f + seed)
+                              + 0.18f * sin(angle * 23.0f - seed)), 11.0f);
+    float radialFade = smoothstep(radius, radius * 1.45f, distanceFromCrater)
+                     * (1.0f - smoothstep(radius * 1.45f,
+                                          radius * 6.2f, distanceFromCrater));
+    return spokes * radialFade;
+}
+
+)",
+R"(
 float3 moonDirectionFromControls() {
     float azimuth = radians(moon_azimuth + time * moon_drift_speed);
     float elevation = radians(clamp(moon_elevation, -89.5f, 89.5f));
@@ -1310,19 +1378,21 @@ float3 compositeMoon(float3 sky, float3 rayDirection,
     float pixelFootprint = max(
         2.0f / (max((float)height, 1.0f) * tangentRadius), 0.006f);
 
-    // A soft atmospheric halo is evaluated outside the lunar disc too. Its
-    // strength follows illuminated fraction, so a crescent never blooms like
-    // a full moon.
+    // A restrained atmospheric aureole is evaluated outside the lunar disc.
+    // Its strength follows illuminated fraction, so a crescent never blooms
+    // like a full moon or turns into a giant soft white spot.
     float phaseAngle = saturate(moon_phase) * (2.0f * PI);
     float illuminatedFraction = 0.5f * (1.0f - cos(phaseAngle));
-    float halo = exp(-max(discRadius - 1.0f, 0.0f)
-                   * lerp(2.8f, 0.72f, saturate(moon_glow)))
-               * step(1.0f, discRadius);
+    float glowAmount = saturate(moon_glow * 0.5f);
+    float haloDistance = max(discRadius - 1.0f, 0.0f);
+    float halo = exp(-haloDistance * lerp(18.0f, 5.0f, glowAmount))
+               * step(1.0f, discRadius)
+               * (1.0f - smoothstep(2.8f, 6.0f, discRadius));
     float dayFactor = smoothstep(-0.12f, 0.05f, sunDirection.y);
-    float3 haloColor = lerp(float3(0.33f, 0.42f, 0.67f),
-                            float3(0.78f, 0.84f, 0.93f), dayFactor);
+    float3 haloColor = lerp(float3(0.38f, 0.43f, 0.54f),
+                            float3(0.72f, 0.77f, 0.84f), dayFactor);
     sky += haloColor * halo * illuminatedFraction
-         * saturate(moon_glow) * max(moon_brightness, 0.0f) * 0.055f;
+         * glowAmount * max(moon_brightness, 0.0f) * 0.035f;
 
     if (discRadius > 1.0f + pixelFootprint) return sky;
 
@@ -1333,31 +1403,69 @@ float3 compositeMoon(float3 sky, float3 rayDirection,
     // crescent, quarter, gibbous, and full phases.
     float3 phaseLight = normalize(float3(
         sin(phaseAngle), 0.08f * sin(phaseAngle * 0.5f), -cos(phaseAngle)));
-    float directLight = saturate(dot(lunarNormal, phaseLight));
 
     float detailAmount = max(moon_surface_detail, 0.0f);
+    float terrainEpsilon = 0.0065f;
+    float centerHeight = lunarTerrainHeight(discPosition);
+    float terrainDx = (lunarTerrainHeight(
+        discPosition + float2(terrainEpsilon, 0.0f)) - centerHeight)
+        / terrainEpsilon;
+    float terrainDy = (lunarTerrainHeight(
+        discPosition + float2(0.0f, terrainEpsilon)) - centerHeight)
+        / terrainEpsilon;
+    float terminatorRelief = lerp(0.035f, 0.18f,
+                                  1.0f - saturate(phaseLight.z));
+    float3 terrainNormal = normalize(lunarNormal
+        + float3(-terrainDx, -terrainDy, 0.0f)
+          * detailAmount * terminatorRelief);
+
+    // Lunar-Lambert reflectance blends Lambert diffuse with the
+    // Lommel-Seeliger lunar term. This avoids the plastic sphere falloff of
+    // pure Lambert shading while retaining deep relief at the terminator.
+    float incidenceCosine = saturate(dot(terrainNormal, phaseLight));
+    float emissionCosine = max(normalZ, 0.015f);
+    float lommelSeeliger = (2.0f * incidenceCosine)
+        / max(incidenceCosine + emissionCosine, 0.015f);
+    float lunarReflectance = lerp(incidenceCosine,
+                                  lommelSeeliger, 0.72f);
+    float oppositionSurge = 1.0f
+        + 0.24f * pow(saturate(phaseLight.z), 28.0f);
+    lunarReflectance *= oppositionSurge;
+
     float4 lunarNoise = CloudNoise.SampleLevel(
         CloudNoiseSampler,
         lunarNormal * float3(0.41f, 0.33f, 0.41f)
         + float3(0.17f, 0.63f, 0.29f), 0.0f);
-    float maria = smoothstep(0.46f, 0.72f,
-        lunarNoise.r * 0.58f + lunarNoise.a * 0.42f);
-    float craterDetail = lunarCraterLayer(discPosition, 5.5f, 11.2f)
-                       + lunarCraterLayer(discPosition, 13.0f, 47.6f) * 0.42f;
-    float surface = 1.0f - maria * 0.27f * detailAmount
-                  + craterDetail * 0.20f * detailAmount;
-    float limb = lerp(0.72f, 1.0f, pow(normalZ, 0.30f));
-    float earthshine = max(moon_earthshine, 0.0f)
-                     * (0.35f + normalZ * 0.65f);
-    float lighting = pow(directLight, 0.62f) * max(moon_brightness, 0.0f)
-                   + earthshine * (1.0f - directLight);
-    float3 lunarAlbedo = lerp(float3(0.49f, 0.50f, 0.52f),
-                              float3(0.82f, 0.80f, 0.73f), dayFactor * 0.42f);
-    float3 moonColor = max(lunarAlbedo * surface * limb * lighting, 0.0f);
+    float maria = lunarMaria(discPosition);
+    float mottling = (lunarNoise.r * 0.56f + lunarNoise.a * 0.44f - 0.5f)
+                   * 0.22f * detailAmount;
+    float ejecta = lunarEjecta(discPosition, float2(0.18f, -0.55f),
+                               0.125f, 2.1f)
+                 + lunarEjecta(discPosition, float2(-0.28f, 0.03f),
+                               0.105f, 4.7f) * 0.55f;
+    float surfaceAlbedo = 0.68f - maria * 0.30f * detailAmount
+                        + mottling + ejecta * 0.045f * detailAmount;
+    surfaceAlbedo = clamp(surfaceAlbedo, 0.27f, 0.90f);
+
+    // Earth is fullest from the lunar surface around our new/crescent Moon,
+    // so earthshine fades as the directly illuminated fraction increases.
+    float earthshinePhase = pow(saturate(1.0f - illuminatedFraction), 0.72f);
+    float earthshine = max(moon_earthshine, 0.0f) * earthshinePhase
+                     * (0.30f + emissionCosine * 0.70f);
+    float directRadiance = lunarReflectance
+                         * max(moon_brightness, 0.0f);
+    float3 regolithColor = lerp(float3(0.51f, 0.50f, 0.47f),
+                                float3(0.60f, 0.58f, 0.52f),
+                                dayFactor * 0.32f);
+    float3 earthshineColor = float3(0.31f, 0.37f, 0.48f);
+    float3 moonColor = regolithColor * surfaceAlbedo * directRadiance
+                     + earthshineColor * surfaceAlbedo * earthshine
+                       * (1.0f - incidenceCosine);
+    moonColor = max(moonColor, 0.0f);
     float discMask = 1.0f - smoothstep(
         1.0f - pixelFootprint, 1.0f + pixelFootprint, discRadius);
-    float phaseVisibility = saturate(directLight * 5.0f
-                          + max(moon_earthshine, 0.0f) * 1.8f);
+    float phaseVisibility = saturate(incidenceCosine * 7.0f
+                          + earthshine * 10.0f);
     return lerp(sky, moonColor, discMask * phaseVisibility);
 }
 
@@ -1439,7 +1547,7 @@ float3 renderAnalyticSky(float3 rayDirection, float3 sunDirection) {
     return compositeMoon(sky, rayDirection, sunDirection);
 }
 
-)"
+)",
 R"(
 [numthreads(16, 16, 1)]
 void CSMain(uint3 DTid : SV_DispatchThreadID) {
@@ -1554,7 +1662,17 @@ void CSSharpen(uint3 DTid : SV_DispatchThreadID) {
                     + (center.rgb - filtered) * (0.42f * volumetricOpacity);
     InputTexture[p] = float4(saturate(resolved), center.a);
 }
-)";
+)" };
+
+static std::string JoinShaderCode() {
+    std::string shader;
+    for (const char* chunk : g_shaderCodeChunks) {
+        shader += chunk;
+    }
+    return shader;
+}
+
+static const std::string g_shaderCode = JoinShaderCode();
 
 // GPU constant buffer structure (must match HLSL)
 struct GPUCloudParams {
@@ -1684,8 +1802,8 @@ static bool InitializeGPU() {
     ID3DBlob* errorBlob = nullptr;
 
     hr = D3DCompile(
-        g_shaderCode,
-        strlen(g_shaderCode),
+        g_shaderCode.data(),
+        g_shaderCode.size(),
         "CloudShader",
         nullptr,
         nullptr,
@@ -1726,8 +1844,8 @@ static bool InitializeGPU() {
     shaderBlob = nullptr;
     errorBlob = nullptr;
     hr = D3DCompile(
-        g_shaderCode,
-        strlen(g_shaderCode),
+        g_shaderCode.data(),
+        g_shaderCode.size(),
         "CloudNoiseShader",
         nullptr,
         nullptr,
@@ -1765,8 +1883,8 @@ static bool InitializeGPU() {
     shaderBlob = nullptr;
     errorBlob = nullptr;
     hr = D3DCompile(
-        g_shaderCode,
-        strlen(g_shaderCode),
+        g_shaderCode.data(),
+        g_shaderCode.size(),
         "CloudSharpenShader",
         nullptr,
         nullptr,
@@ -2012,7 +2130,7 @@ static bool RenderOnGPU(
 #define NAME "VolumetricCloudShader"
 #define DESCRIPTION "Volumetric weather with explosive towers, day/night sky, stars, and phased moon"
 #define MAJOR_VERSION 1
-#define MINOR_VERSION 11
+#define MINOR_VERSION 12
 #define BUG_VERSION 0
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1
@@ -2021,22 +2139,29 @@ static bool RenderOnGPU(
 
 enum {
     INPUT_LAYER = 0,
+    CLOUD_VOLUME_GROUP_START,
     CLOUD_RADIUS_PARAM,
     CLOUD_DENSITY_PARAM,
     ABSORPTION_PARAM,
     SCATTERING_PARAM,
     MARCH_STEPS_PARAM,
     LIGHT_STEPS_PARAM,
+    CLOUD_VOLUME_GROUP_END,
+    MANUAL_SUN_GROUP_START,
     SUN_X_PARAM,
     SUN_Y_PARAM,
     SUN_Z_PARAM,
     SUN_COLOR_PARAM,
-    WIND_SPEED_PARAM,
-    NOISE_SCALE_PARAM,
-    DETAIL_PARAM,
+    MANUAL_SUN_GROUP_END,
+    CAMERA_GROUP_START,
     CAMERA_DIST_PARAM,
     CAMERA_PITCH_PARAM,
     CAMERA_YAW_PARAM,
+    CAMERA_GROUP_END,
+    CLOUD_SHAPE_GROUP_START,
+    WIND_SPEED_PARAM,
+    NOISE_SCALE_PARAM,
+    DETAIL_PARAM,
     CLOUD_COVERAGE_PARAM,
     CLOUD_TYPE_PARAM,
     EROSION_STRENGTH_PARAM,
@@ -2044,16 +2169,22 @@ enum {
     WIND_DIRECTION_PARAM,
     WIND_SHEAR_PARAM,
     WIND_TURBULENCE_PARAM,
+    CLOUD_SHAPE_GROUP_END,
+    CLOUD_LAYERS_GROUP_START,
     CLOUD_REGIME_PARAM,
     MID_LEVEL_AMOUNT_PARAM,
     HIGH_LEVEL_AMOUNT_PARAM,
     STORM_DEVELOPMENT_PARAM,
+    CLOUD_LAYERS_GROUP_END,
+    HERO_TOWER_GROUP_START,
     TOWER_DEVELOPMENT_PARAM,
     TOWER_SCALE_PARAM,
     CAULIFLOWER_DETAIL_PARAM,
     TOWER_POSITION_X_PARAM,
     TOWER_DISTANCE_PARAM,
     TOWER_ISOLATION_PARAM,
+    HERO_TOWER_GROUP_END,
+    RAIN_GROUP_START,
     RAIN_ENABLED_PARAM,
     RAIN_AMOUNT_PARAM,
     RAIN_PREVALENCE_PARAM,
@@ -2061,6 +2192,8 @@ enum {
     RAIN_MIST_PARAM,
     RAIN_EVAPORATION_PARAM,
     RAIN_FALL_SPEED_PARAM,
+    RAIN_GROUP_END,
+    DAY_SKY_GROUP_START,
     DAY_CYCLE_ENABLED_PARAM,
     TIME_OF_DAY_PARAM,
     DAY_CYCLE_SPEED_PARAM,
@@ -2074,10 +2207,14 @@ enum {
     SUN_DISK_SIZE_PARAM,
     SUN_BRIGHTNESS_PARAM,
     NIGHT_BRIGHTNESS_PARAM,
+    DAY_SKY_GROUP_END,
+    STARS_GROUP_START,
     STARS_ENABLED_PARAM,
     STAR_AMOUNT_PARAM,
     STAR_BRIGHTNESS_PARAM,
     STAR_TWINKLE_PARAM,
+    STARS_GROUP_END,
+    MOON_GROUP_START,
     MOON_ENABLED_PARAM,
     MOON_AZIMUTH_PARAM,
     MOON_ELEVATION_PARAM,
@@ -2088,7 +2225,102 @@ enum {
     MOON_GLOW_PARAM,
     MOON_SURFACE_DETAIL_PARAM,
     MOON_EARTHSHINE_PARAM,
+    MOON_GROUP_END,
     NUM_PARAMS
+};
+
+// Parameter array indices above are free to follow the organized UI. These
+// disk IDs deliberately retain the original v1.11 identities so moving a
+// control into a topic does not remap saved values and keyframes by position.
+enum {
+    CLOUD_RADIUS_DISK_ID = 1,
+    CLOUD_DENSITY_DISK_ID = 2,
+    ABSORPTION_DISK_ID = 3,
+    SCATTERING_DISK_ID = 4,
+    MARCH_STEPS_DISK_ID = 5,
+    LIGHT_STEPS_DISK_ID = 6,
+    SUN_X_DISK_ID = 7,
+    SUN_Y_DISK_ID = 8,
+    SUN_Z_DISK_ID = 9,
+    SUN_COLOR_DISK_ID = 10,
+    WIND_SPEED_DISK_ID = 11,
+    NOISE_SCALE_DISK_ID = 12,
+    DETAIL_DISK_ID = 13,
+    CAMERA_DIST_DISK_ID = 14,
+    CAMERA_PITCH_DISK_ID = 15,
+    CAMERA_YAW_DISK_ID = 16,
+    CLOUD_COVERAGE_DISK_ID = 17,
+    CLOUD_TYPE_DISK_ID = 18,
+    EROSION_STRENGTH_DISK_ID = 19,
+    BILLOW_SIZE_DISK_ID = 20,
+    WIND_DIRECTION_DISK_ID = 21,
+    WIND_SHEAR_DISK_ID = 22,
+    WIND_TURBULENCE_DISK_ID = 23,
+    CLOUD_REGIME_DISK_ID = 24,
+    MID_LEVEL_AMOUNT_DISK_ID = 25,
+    HIGH_LEVEL_AMOUNT_DISK_ID = 26,
+    STORM_DEVELOPMENT_DISK_ID = 27,
+    TOWER_DEVELOPMENT_DISK_ID = 28,
+    TOWER_SCALE_DISK_ID = 29,
+    CAULIFLOWER_DETAIL_DISK_ID = 30,
+    TOWER_POSITION_X_DISK_ID = 31,
+    TOWER_DISTANCE_DISK_ID = 32,
+    TOWER_ISOLATION_DISK_ID = 33,
+    RAIN_ENABLED_DISK_ID = 34,
+    RAIN_AMOUNT_DISK_ID = 35,
+    RAIN_PREVALENCE_DISK_ID = 36,
+    RAIN_SHAFT_DETAIL_DISK_ID = 37,
+    RAIN_MIST_DISK_ID = 38,
+    RAIN_EVAPORATION_DISK_ID = 39,
+    RAIN_FALL_SPEED_DISK_ID = 40,
+    DAY_CYCLE_ENABLED_DISK_ID = 41,
+    TIME_OF_DAY_DISK_ID = 42,
+    DAY_CYCLE_SPEED_DISK_ID = 43,
+    SUN_PATH_ROTATION_DISK_ID = 44,
+    SUN_PEAK_ELEVATION_DISK_ID = 45,
+    SKY_VIBRANCY_DISK_ID = 46,
+    SKY_EXPOSURE_DISK_ID = 47,
+    TWILIGHT_INTENSITY_DISK_ID = 48,
+    TWILIGHT_RANGE_DISK_ID = 49,
+    HORIZON_HAZE_DISK_ID = 50,
+    SUN_DISK_SIZE_DISK_ID = 51,
+    SUN_BRIGHTNESS_DISK_ID = 52,
+    NIGHT_BRIGHTNESS_DISK_ID = 53,
+    STARS_ENABLED_DISK_ID = 54,
+    STAR_AMOUNT_DISK_ID = 55,
+    STAR_BRIGHTNESS_DISK_ID = 56,
+    STAR_TWINKLE_DISK_ID = 57,
+    MOON_ENABLED_DISK_ID = 58,
+    MOON_AZIMUTH_DISK_ID = 59,
+    MOON_ELEVATION_DISK_ID = 60,
+    MOON_DRIFT_SPEED_DISK_ID = 61,
+    MOON_SIZE_DISK_ID = 62,
+    MOON_PHASE_DISK_ID = 63,
+    MOON_BRIGHTNESS_DISK_ID = 64,
+    MOON_GLOW_DISK_ID = 65,
+    MOON_SURFACE_DETAIL_DISK_ID = 66,
+    MOON_EARTHSHINE_DISK_ID = 67,
+
+    CLOUD_VOLUME_GROUP_DISK_ID = 1001,
+    CLOUD_VOLUME_GROUP_END_DISK_ID = 1002,
+    MANUAL_SUN_GROUP_DISK_ID = 1003,
+    MANUAL_SUN_GROUP_END_DISK_ID = 1004,
+    CAMERA_GROUP_DISK_ID = 1005,
+    CAMERA_GROUP_END_DISK_ID = 1006,
+    CLOUD_SHAPE_GROUP_DISK_ID = 1007,
+    CLOUD_SHAPE_GROUP_END_DISK_ID = 1008,
+    CLOUD_LAYERS_GROUP_DISK_ID = 1009,
+    CLOUD_LAYERS_GROUP_END_DISK_ID = 1010,
+    HERO_TOWER_GROUP_DISK_ID = 1011,
+    HERO_TOWER_GROUP_END_DISK_ID = 1012,
+    RAIN_GROUP_DISK_ID = 1013,
+    RAIN_GROUP_END_DISK_ID = 1014,
+    DAY_SKY_GROUP_DISK_ID = 1015,
+    DAY_SKY_GROUP_END_DISK_ID = 1016,
+    STARS_GROUP_DISK_ID = 1017,
+    STARS_GROUP_END_DISK_ID = 1018,
+    MOON_GROUP_DISK_ID = 1019,
+    MOON_GROUP_END_DISK_ID = 1020
 };
 
 typedef struct {
@@ -2418,7 +2650,10 @@ static PF_Err GlobalSetup(PF_InData *in_data, PF_OutData *out_data,
     // Render() consumes PF_Pixel8. Advertising deep-color awareness made AE
     // allocate and hand us 16-bpc buffers that this implementation cannot use.
     out_data->out_flags = PF_OutFlag_PIX_INDEPENDENT;
-    out_data->out_flags2 = 0;  // Cannot support threaded rendering with shared GPU resources
+    // Topics use START_COLLAPSED selectively, keeping the common controls
+    // visible while advanced sections stay compact in AE's Effect Controls.
+    out_data->out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG;
+    // Shared D3D resources remain serialized by g_gpuMutex in Render().
     return PF_Err_NONE;
 }
 
@@ -2445,278 +2680,337 @@ static PF_Err ParamsSetup(PF_InData *in_data, PF_OutData *out_data,
                           PF_ParamDef *params[], PF_LayerDef *output) {
     PF_ParamDef def;
 
+    PF_ADD_TOPICX("Volume & Render Quality", PF_ParamFlag_START_COLLAPSED,
+                  CLOUD_VOLUME_GROUP_DISK_ID);
+
     // A larger default produces a useful hero-cloud framing in a 16:9 comp.
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Layer Thickness", 0.1, 5.0, 0.1, 5.0, 2.6,
-                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_RADIUS_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_RADIUS_DISK_ID);
 
     // Physical density multiplier; it drives extinction and opacity.
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Coverage / Density", 0.1, 10.0, 0.1, 10.0, 3.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_DENSITY_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_DENSITY_DISK_ID);
 
     // Default: 0.9 (ABSORPTION_COEFFICIENT in original)
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Absorption", 0.0, 2.0, 0.0, 2.0, 1.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, ABSORPTION_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, ABSORPTION_DISK_ID);
 
     // Henyey-Greenstein anisotropy. Values near 0.4 give natural silver lining.
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Scattering", -0.85, 0.85, -0.85, 0.85, 0.25,
-                         PF_Precision_HUNDREDTHS, 0, 0, SCATTERING_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SCATTERING_DISK_ID);
 
     // The shader intersects the volume first, so every step now contributes.
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("March Steps", 8, 120, 8, 120, 80,
-                         PF_Precision_INTEGER, 0, 0, MARCH_STEPS_PARAM);
+                         PF_Precision_INTEGER, 0, 0, MARCH_STEPS_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Light Steps", 2, 16, 2, 16, 10,
-                         PF_Precision_INTEGER, 0, 0, LIGHT_STEPS_PARAM);
+                         PF_Precision_INTEGER, 0, 0, LIGHT_STEPS_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(CLOUD_VOLUME_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Manual Sun", PF_ParamFlag_START_COLLAPSED,
+                  MANUAL_SUN_GROUP_DISK_ID);
 
     // Sun position: (2.0, 1.0, 2.0) in original
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sun X", -10.0, 10.0, -10.0, 10.0, 3.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_X_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SUN_X_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sun Y", -10.0, 10.0, -10.0, 10.0, 1.5,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_Y_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SUN_Y_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sun Z", -10.0, 10.0, -10.0, 10.0, 1.5,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_Z_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SUN_Z_DISK_ID);
 
     // Neutral-warm daylight; the previous saturated orange default tinted the
     // entire cloud rather than just the terminator and silver lining.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_COLOR("Sun Color", 255, 242, 219, SUN_COLOR_PARAM);
+    PF_ADD_COLOR("Sun Color", 255, 242, 219, SUN_COLOR_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(MANUAL_SUN_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Camera", PF_ParamFlag_START_COLLAPSED,
+                  CAMERA_GROUP_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Focal Length", 1.0, 10.0, 1.0, 10.0, 3.0,
+                         PF_Precision_HUNDREDTHS, 0, 0, CAMERA_DIST_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_FLOAT_SLIDERX("Pitch", -89.0, 90.0, -89.0, 90.0, 90.0,
+                         PF_Precision_HUNDREDTHS, 0, 0, CAMERA_PITCH_DISK_ID);
+
+    // Angle controls are cyclic and can be spun/keyframed beyond one turn.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_ANGLE("Yaw", 0.0, CAMERA_YAW_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(CAMERA_GROUP_END_DISK_ID);
+
+    // This is the primary working section, so it starts open.
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_TOPIC("Cloud Shape & Motion", CLOUD_SHAPE_GROUP_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Wind Speed", 0.0, 500, 0, 500, 100,
-                         PF_Precision_INTEGER, 0, 0, WIND_SPEED_PARAM);
+                         PF_Precision_INTEGER, 0, 0, WIND_SPEED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Noise Scale", 0.1, 5.0, 0.1, 5.0, 2.4,
-                         PF_Precision_HUNDREDTHS, 0, 0, NOISE_SCALE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, NOISE_SCALE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Detail", 1, 8, 1, 8, 6,
-                         PF_Precision_INTEGER, 0, 0, DETAIL_PARAM);
-
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Camera Focal Length", 1.0, 10.0, 1.0, 10.0, 3.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CAMERA_DIST_PARAM);
-
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Camera Pitch", -89.0, 90.0, -89.0, 90.0, 90.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CAMERA_PITCH_PARAM);
-
-    AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Camera Yaw", -180.0, 180.0, -180.0, 180.0, 0.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CAMERA_YAW_PARAM);
+                         PF_Precision_INTEGER, 0, 0, DETAIL_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Cloud Coverage", 0.0, 100.0, 0.0, 100.0, 57.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_COVERAGE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_COVERAGE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Cloud Type", 0.0, 100.0, 0.0, 100.0, 88.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_TYPE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, CLOUD_TYPE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Edge Erosion", 0.0, 200.0, 0.0, 200.0, 72.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, EROSION_STRENGTH_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, EROSION_STRENGTH_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Billow Size", 0.25, 3.0, 0.25, 3.0, 1.15,
-                         PF_Precision_HUNDREDTHS, 0, 0, BILLOW_SIZE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, BILLOW_SIZE_DISK_ID);
 
+    // Wind direction is a true AE angle dial with unlimited revolutions.
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Wind Direction", -180.0, 180.0, -180.0, 180.0, -35.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, WIND_DIRECTION_PARAM);
+    PF_ADD_ANGLE("Wind Direction", -35.0, WIND_DIRECTION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Altitude Wind Shear", 0.0, 200.0, 0.0, 200.0, 70.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, WIND_SHEAR_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, WIND_SHEAR_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Turbulent Evolution", 0.0, 200.0, 0.0, 200.0, 80.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, WIND_TURBULENCE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, WIND_TURBULENCE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(CLOUD_SHAPE_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Cloud Types & Layers", PF_ParamFlag_START_COLLAPSED,
+                  CLOUD_LAYERS_GROUP_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_POPUP(
         "Cloud Regime", 11, 1,
         "Mixed Weather|Cirrus|Cirrostratus|Cirrocumulus|Altocumulus|Altostratus|Nimbostratus|Stratocumulus|Stratus|Cumulus|Cumulonimbus",
-        CLOUD_REGIME_PARAM);
+        CLOUD_REGIME_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Mid-Level Clouds", 0.0, 100.0, 0.0, 100.0, 32.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MID_LEVEL_AMOUNT_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MID_LEVEL_AMOUNT_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("High-Level Clouds", 0.0, 100.0, 0.0, 100.0, 20.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, HIGH_LEVEL_AMOUNT_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, HIGH_LEVEL_AMOUNT_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Storm Development", 0.0, 100.0, 0.0, 100.0, 5.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, STORM_DEVELOPMENT_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, STORM_DEVELOPMENT_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(CLOUD_LAYERS_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Hero Cloud Tower", PF_ParamFlag_START_COLLAPSED,
+                  HERO_TOWER_GROUP_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Tower Development", 0.0, 200.0, 0.0, 200.0, 0.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_DEVELOPMENT_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_DEVELOPMENT_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Tower Width", 25.0, 300.0, 25.0, 300.0, 120.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_SCALE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_SCALE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Cauliflower Detail", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, CAULIFLOWER_DETAIL_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, CAULIFLOWER_DETAIL_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Tower Position X", -100.0, 100.0, -100.0, 100.0, 0.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_POSITION_X_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_POSITION_X_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Tower Distance", 1.0, 100.0, 1.0, 100.0, 18.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_DISTANCE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_DISTANCE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Tower Isolation", 0.0, 100.0, 0.0, 100.0, 70.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_ISOLATION_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TOWER_ISOLATION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOX("Enable Rain", "", FALSE, 0, RAIN_ENABLED_PARAM);
+    PF_END_TOPIC(HERO_TOWER_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Rain & Virga", PF_ParamFlag_START_COLLAPSED,
+                  RAIN_GROUP_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOX("Enable Rain", "", FALSE, 0, RAIN_ENABLED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Rain Amount", 0.0, 200.0, 0.0, 200.0, 75.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_AMOUNT_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_AMOUNT_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Rain Prevalence", 0.0, 100.0, 0.0, 100.0, 42.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_PREVALENCE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_PREVALENCE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Rain Shaft Detail", 0.0, 100.0, 0.0, 100.0, 62.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_SHAFT_DETAIL_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_SHAFT_DETAIL_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Rain Mist", 0.0, 100.0, 0.0, 100.0, 45.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_MIST_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_MIST_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Virga / Evaporation", 0.0, 100.0, 0.0, 100.0, 20.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_EVAPORATION_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_EVAPORATION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Rain Fall Speed", 0.0, 300.0, 0.0, 300.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_FALL_SPEED_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, RAIN_FALL_SPEED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOX("Enable Time of Day", "", TRUE, 0, DAY_CYCLE_ENABLED_PARAM);
+    PF_END_TOPIC(RAIN_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Day Cycle & Sky", PF_ParamFlag_START_COLLAPSED,
+                  DAY_SKY_GROUP_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOX("Enable Time of Day", "", TRUE, 0, DAY_CYCLE_ENABLED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Time of Day", 0.0, 24.0, 0.0, 24.0, 12.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TIME_OF_DAY_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TIME_OF_DAY_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Day Cycle Speed", -24.0, 24.0, -24.0, 24.0, 0.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, DAY_CYCLE_SPEED_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, DAY_CYCLE_SPEED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Sun Path Rotation", -180.0, 180.0, -180.0, 180.0, 0.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_PATH_ROTATION_PARAM);
+    PF_ADD_ANGLE("Sun Path Rotation", 0.0, SUN_PATH_ROTATION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sun Peak Elevation", 5.0, 90.0, 5.0, 90.0, 65.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_PEAK_ELEVATION_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SUN_PEAK_ELEVATION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sky Vibrancy", 0.0, 200.0, 0.0, 200.0, 130.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SKY_VIBRANCY_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SKY_VIBRANCY_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sky Exposure", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SKY_EXPOSURE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SKY_EXPOSURE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Twilight Vibrancy", 0.0, 200.0, 0.0, 200.0, 130.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TWILIGHT_INTENSITY_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TWILIGHT_INTENSITY_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Twilight Range", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, TWILIGHT_RANGE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, TWILIGHT_RANGE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Horizon Haze", 0.0, 200.0, 0.0, 200.0, 80.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, HORIZON_HAZE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, HORIZON_HAZE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sun Disc Size", 10.0, 500.0, 10.0, 500.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_DISK_SIZE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SUN_DISK_SIZE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Sun Brightness", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, SUN_BRIGHTNESS_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, SUN_BRIGHTNESS_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Night Brightness", 0.0, 100.0, 0.0, 100.0, 12.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, NIGHT_BRIGHTNESS_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, NIGHT_BRIGHTNESS_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOX("Enable Stars", "", TRUE, 0, STARS_ENABLED_PARAM);
+    PF_END_TOPIC(DAY_SKY_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Stars", PF_ParamFlag_START_COLLAPSED,
+                  STARS_GROUP_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_CHECKBOX("Enable Stars", "", TRUE, 0, STARS_ENABLED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Star Amount", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, STAR_AMOUNT_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, STAR_AMOUNT_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Star Brightness", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, STAR_BRIGHTNESS_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, STAR_BRIGHTNESS_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Star Twinkle", 0.0, 100.0, 0.0, 100.0, 30.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, STAR_TWINKLE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, STAR_TWINKLE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_CHECKBOX("Enable Moon", "", TRUE, 0, MOON_ENABLED_PARAM);
+    PF_END_TOPIC(STARS_GROUP_END_DISK_ID);
+
+    PF_ADD_TOPICX("Moon", PF_ParamFlag_START_COLLAPSED,
+                  MOON_GROUP_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Moon Azimuth", -180.0, 180.0, -180.0, 180.0, -38.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_AZIMUTH_PARAM);
+    PF_ADD_CHECKBOX("Enable Moon", "", TRUE, 0, MOON_ENABLED_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_ANGLE("Moon Azimuth", -38.0, MOON_AZIMUTH_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Elevation", -89.0, 89.0, -89.0, 89.0, 42.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_ELEVATION_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_ELEVATION_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Drift Speed", -30.0, 30.0, -30.0, 30.0, 0.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_DRIFT_SPEED_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_DRIFT_SPEED_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
-    PF_ADD_FLOAT_SLIDERX("Moon Size", 10.0, 800.0, 10.0, 800.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_SIZE_PARAM);
+    PF_ADD_FLOAT_SLIDERX("Moon Size", 10.0, 3000.0, 10.0, 3000.0, 100.0,
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_SIZE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Phase", 0.0, 100.0, 0.0, 100.0, 50.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_PHASE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_PHASE_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Brightness", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_BRIGHTNESS_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_BRIGHTNESS_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Glow", 0.0, 200.0, 0.0, 200.0, 55.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_GLOW_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_GLOW_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Surface Detail", 0.0, 200.0, 0.0, 200.0, 100.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_SURFACE_DETAIL_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_SURFACE_DETAIL_DISK_ID);
 
     AEFX_CLR_STRUCT(def);
     PF_ADD_FLOAT_SLIDERX("Moon Earthshine", 0.0, 100.0, 0.0, 100.0, 6.0,
-                         PF_Precision_HUNDREDTHS, 0, 0, MOON_EARTHSHINE_PARAM);
+                         PF_Precision_HUNDREDTHS, 0, 0, MOON_EARTHSHINE_DISK_ID);
+
+    AEFX_CLR_STRUCT(def);
+    PF_END_TOPIC(MOON_GROUP_END_DISK_ID);
 
     out_data->num_params = NUM_PARAMS;
     return PF_Err_NONE;
@@ -2747,12 +3041,14 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     int detail = (int)params[DETAIL_PARAM]->u.fs_d.value;
     float camera_dist = (float)params[CAMERA_DIST_PARAM]->u.fs_d.value;
     float camera_pitch = (float)params[CAMERA_PITCH_PARAM]->u.fs_d.value;
-    float camera_yaw = (float)params[CAMERA_YAW_PARAM]->u.fs_d.value;
+    float camera_yaw = (float)FIX_2_FLOAT(
+        params[CAMERA_YAW_PARAM]->u.ad.value);
     float cloud_coverage = (float)params[CLOUD_COVERAGE_PARAM]->u.fs_d.value / 100.0f;
     float cloud_type = (float)params[CLOUD_TYPE_PARAM]->u.fs_d.value / 100.0f;
     float erosion_strength = (float)params[EROSION_STRENGTH_PARAM]->u.fs_d.value / 100.0f;
     float billow_size = (float)params[BILLOW_SIZE_PARAM]->u.fs_d.value;
-    float wind_direction = (float)params[WIND_DIRECTION_PARAM]->u.fs_d.value;
+    float wind_direction = (float)FIX_2_FLOAT(
+        params[WIND_DIRECTION_PARAM]->u.ad.value);
     float wind_shear = (float)params[WIND_SHEAR_PARAM]->u.fs_d.value / 100.0f;
     float wind_turbulence = (float)params[WIND_TURBULENCE_PARAM]->u.fs_d.value / 100.0f;
     int cloud_regime = (int)params[CLOUD_REGIME_PARAM]->u.pd.value;
@@ -2793,8 +3089,8 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
         (float)params[TIME_OF_DAY_PARAM]->u.fs_d.value;
     float day_cycle_speed =
         (float)params[DAY_CYCLE_SPEED_PARAM]->u.fs_d.value;
-    float sun_path_rotation =
-        (float)params[SUN_PATH_ROTATION_PARAM]->u.fs_d.value;
+    float sun_path_rotation = (float)FIX_2_FLOAT(
+        params[SUN_PATH_ROTATION_PARAM]->u.ad.value);
     float sun_peak_elevation =
         (float)params[SUN_PEAK_ELEVATION_PARAM]->u.fs_d.value;
     float sky_vibrancy =
@@ -2821,8 +3117,8 @@ static PF_Err Render(PF_InData *in_data, PF_OutData *out_data,
     float star_twinkle =
         (float)params[STAR_TWINKLE_PARAM]->u.fs_d.value / 100.0f;
     int moon_enabled = params[MOON_ENABLED_PARAM]->u.bd.value ? 1 : 0;
-    float moon_azimuth =
-        (float)params[MOON_AZIMUTH_PARAM]->u.fs_d.value;
+    float moon_azimuth = (float)FIX_2_FLOAT(
+        params[MOON_AZIMUTH_PARAM]->u.ad.value);
     float moon_elevation =
         (float)params[MOON_ELEVATION_PARAM]->u.fs_d.value;
     float moon_drift_speed =
